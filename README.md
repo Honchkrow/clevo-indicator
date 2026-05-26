@@ -45,7 +45,21 @@ clevo-indicator 80 60    # CPU 80%, GPU 60%
 clevo-indicator -?       # help and current EC status
 ```
 
-Tray label `C65 G58 F80 F60` = CPU °C, GPU °C, CPU fan %, GPU fan %. Click the icon for AUTO, linked 60–100%, or per-fan CPU/GPU presets.
+Tray shows `fan.jpg` icon plus label `C65 G58` (CPU °C, GPU °C). **Left-click** opens the menu with full fan status and controls.
+
+### Change the tray icon
+
+`fan.jpg` is **not** compiled into the binary. After editing `icons/hicolor/scalable/status/fan.jpg`:
+
+```bash
+sudo make install-icons    # copy icon only
+# or
+sudo make install          # binary + icon
+```
+
+Then quit and restart `clevo-indicator`. `make` alone does not update the icon.
+
+The app copies `fan.jpg` into your runtime directory (`$XDG_RUNTIME_DIR/clevo-indicator/`) using a filename that includes the file modification time, so GNOME reloads the image instead of keeping an old cached bitmap. If you replace the icon while the app is already running, save the new `fan.jpg` (so its timestamp changes); the tray icon should refresh within about half a second.
 
 The app forks into a UI process (desktop user) and an EC worker (root) so the tray can show while EC I/O stays privileged; you may see two processes in `ps`.
 

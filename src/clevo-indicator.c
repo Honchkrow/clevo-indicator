@@ -9,16 +9,6 @@
  (diemer@gmx.de)
 
  ============================================================================
-
- TEST:
- gcc clevo-indicator.c -o clevo-indicator \
-   `pkg-config --cflags --libs ayatana-appindicator3-0.1 gtk+-3.0` -lm
- sudo chown root clevo-indicator
- sudo chmod u+s clevo-indicator
-
- Run as effective uid = root, but uid = desktop user (in order to use indicator).
-
- ============================================================================
  Auto fan control algorithm:
 
  The algorithm is to replace the builtin auto fan-control algorithm in Clevo
@@ -33,8 +23,9 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <libgen.h>
+#include <limits.h>
 #include <fcntl.h>
-#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,12 +33,15 @@
 #include <string.h>
 #include <sys/io.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <glib.h>
+#include <glib/gstdio.h>
+#include <gio/gio.h>
 #include <gtk/gtk.h>
 #include <libayatana-appindicator3-0.1/libayatana-appindicator/app-indicator.h>
 
@@ -80,10 +74,11 @@
 #define EC_FAN_PORT_CPU 0x01
 #define EC_FAN_PORT_GPU 0x02
 
-#define MAX_FAN_RPM 4400.0
 #define MIN_FAN_DUTY 0
 #define MAX_FAN_DUTY 100
-#define INDICATOR_LABEL_GUIDE "C99 G99 F99 F99"
+#define INDICATOR_LABEL_GUIDE "C99 G99"
+#define INDICATOR_ICON_FILE "fan.jpg"
+#define INDICATOR_ICON_INSTALL_DIR "/usr/local/share/icons"
 
 typedef enum {
     NA = 0,
@@ -102,14 +97,21 @@ static int main_dump_fan(void);
 static int main_test_fan(int duty_percentage);
 static int main_test_fan_dual(int fan1_duty, int fan2_duty);
 static gboolean ui_update(gpointer user_data);
+static void ui_clear_manual_requests(void);
 static void ui_command_set_fan(long fan_duty);
 static void ui_command_set_fan1(long fan_duty);
 static void ui_command_set_fan2(long fan_duty);
 static void ui_command_quit(gchar* command);
 static void ui_toggle_menuitems(MenuItemType active_type, int active_duty);
-static void ui_format_status_tray(char* buf, size_t size);
 static void ui_format_status_menu(char* buf, size_t size);
+static int ui_build_icon_path(const char* theme_dir, char* icon_file,
+        size_t icon_size);
+static int ui_resolve_tray_icons(char* theme_path, size_t theme_size,
+        char* icon_file, size_t icon_size);
+static int ui_refresh_tray_icon(int force);
 static int validate_fan_duty(int duty);
+static void main_sanitize_cwd(void);
+static int ec_load_ec_sys_module(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
 static int ec_auto_duty_adjust_for_temp(int temp, int duty);
@@ -136,6 +138,9 @@ static void signal_term(__sighandler_t handler);
 
 static AppIndicator* indicator = NULL;
 static GtkWidget* status_menu_label = NULL;
+static char ui_icon_source[PATH_MAX];
+static char ui_icon_published[PATH_MAX];
+static time_t ui_icon_published_mtime;
 
 struct {
     char label[256];
@@ -192,6 +197,7 @@ static int ui_active_duty = 0;
 static pid_t parent_pid = 0;
 
 int main(int argc, char* argv[]) {
+    main_sanitize_cwd();
     printf("Dual-fan control utility for Clevo laptops\n");
     if (check_proc_instances(NAME) > 1) {
         fprintf(stderr, "Multiple running instances of %s!\n", NAME);
@@ -248,8 +254,7 @@ run:\n\
     sudo chmod u+s  clevo-indicator\n\
 \n\
 Note any fan duty change should take 1-2 seconds to come into effect - you\n\
-can verify by the fan speed displayed on indicator icon and also louder fan\n\
-noise.\n\
+can verify by the tray label or menu and also louder fan noise.\n\
 \n\
 In the indicator mode, this program would always attempt to load kernel\n\
 module 'ec_sys', in order to query EC information from\n\
@@ -286,6 +291,31 @@ static int validate_fan_duty(int duty) {
     return duty >= MIN_FAN_DUTY && duty <= MAX_FAN_DUTY;
 }
 
+static void main_sanitize_cwd(void) {
+    if (chdir("/") != 0 && chdir("/tmp") != 0)
+        perror("chdir");
+}
+
+static int ec_load_ec_sys_module(void) {
+    pid_t pid = fork();
+    if (pid < 0)
+        return EXIT_FAILURE;
+    if (pid == 0) {
+        if (chdir("/") != 0)
+            _exit(126);
+        execl("/sbin/modprobe", "modprobe", "ec_sys", (char*) NULL);
+        execl("/usr/sbin/modprobe", "modprobe", "ec_sys", (char*) NULL);
+        execl("/bin/modprobe", "modprobe", "ec_sys", (char*) NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0)
+        return EXIT_FAILURE;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        return EXIT_SUCCESS;
+    return EXIT_FAILURE;
+}
+
 static void main_init_share(void) {
     void* shm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED,
             -1, 0);
@@ -312,7 +342,8 @@ static void main_init_share(void) {
 
 static int main_ec_worker(void) {
     setuid(0);
-    system("modprobe ec_sys");
+    if (ec_load_ec_sys_module() != EXIT_SUCCESS)
+        printf("warning: unable to load ec_sys kernel module\n");
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
@@ -399,6 +430,23 @@ static void main_ui_worker(int argc, char** argv) {
 
     gtk_init(&argc, &argv);
 
+    char icon_theme_path[PATH_MAX];
+    char icon_file[PATH_MAX];
+    if (ui_resolve_tray_icons(icon_theme_path, sizeof(icon_theme_path), icon_file,
+                sizeof(icon_file)) != 0) {
+        fprintf(stderr, "Tray icon missing (%s). Run: sudo make install\n",
+                INDICATOR_ICON_FILE);
+        exit(EXIT_FAILURE);
+    }
+    strncpy(ui_icon_source, icon_file, sizeof(ui_icon_source) - 1);
+    ui_icon_source[sizeof(ui_icon_source) - 1] = '\0';
+    ui_icon_published[0] = '\0';
+    ui_icon_published_mtime = 0;
+    if (ui_refresh_tray_icon(1) < 0) {
+        fprintf(stderr, "Unable to publish tray icon from %s\n", ui_icon_source);
+        exit(EXIT_FAILURE);
+    }
+
     GtkWidget* indicator_menu = gtk_menu_new();
     GtkWidget* status_item = gtk_menu_item_new();
     status_menu_label = gtk_label_new("Loading...");
@@ -429,11 +477,11 @@ static void main_ui_worker(int argc, char** argv) {
     }
     gtk_widget_show_all(indicator_menu);
 
-    indicator = app_indicator_new(NAME, "brasero",
-            APP_INDICATOR_CATEGORY_HARDWARE);
+    indicator = app_indicator_new_with_path(NAME, ui_icon_published,
+            APP_INDICATOR_CATEGORY_HARDWARE, icon_theme_path);
     g_assert(indicator != NULL);
-    app_indicator_set_label(indicator, "C-- G-- F-- F--",
-            INDICATOR_LABEL_GUIDE);
+    app_indicator_set_icon_theme_path(indicator, icon_theme_path);
+    app_indicator_set_label(indicator, "C-- G--", INDICATOR_LABEL_GUIDE);
     app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
     app_indicator_set_ordering_index(indicator, -2);
     app_indicator_set_title(indicator, "Clevo Fan Control");
@@ -446,6 +494,7 @@ static void main_ui_worker(int argc, char** argv) {
 }
 
 static void main_on_sigchld(int signum) {
+    (void) signum;
     printf("main on worker quit signal\n");
     exit(EXIT_SUCCESS);
 }
@@ -488,14 +537,122 @@ static int main_test_fan_dual(int fan1_duty, int fan2_duty) {
     return EXIT_SUCCESS;
 }
 
-static void ui_format_status_tray(char* buf, size_t size) {
-    snprintf(buf, size, "C%2d G%2d F%2d F%2d", share_info->cpu_temp,
-            share_info->gpu_temp, share_info->fan1_duty, share_info->fan2_duty);
+static int ui_build_icon_path(const char* theme_dir, char* icon_file,
+        size_t icon_size) {
+    static const char subpath[] = "/hicolor/scalable/status/";
+    size_t need = strlen(theme_dir) + sizeof(subpath) - 1
+            + strlen(INDICATOR_ICON_FILE) + 1;
+    if (need > icon_size)
+        return -1;
+    snprintf(icon_file, icon_size, "%s%s%s", theme_dir, subpath,
+            INDICATOR_ICON_FILE);
+    return 0;
+}
+
+static int ui_resolve_tray_icons(char* theme_path, size_t theme_size,
+        char* icon_file, size_t icon_size) {
+    const char* install_theme = INDICATOR_ICON_INSTALL_DIR;
+    char install_icon[PATH_MAX];
+    char dev_theme[PATH_MAX];
+    char dev_icon[PATH_MAX];
+    int has_install = 0;
+    int has_dev = 0;
+
+    if (ui_build_icon_path(install_theme, install_icon, sizeof(install_icon)) == 0
+            && access(install_icon, R_OK) == 0)
+        has_install = 1;
+
+    char exe[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len > 0) {
+        exe[len] = '\0';
+        char exe_copy[PATH_MAX];
+        strncpy(exe_copy, exe, sizeof(exe_copy) - 1);
+        exe_copy[sizeof(exe_copy) - 1] = '\0';
+        char* bindir = dirname(exe_copy);
+        char icons_path[PATH_MAX];
+        snprintf(icons_path, sizeof(icons_path), "%s/../icons", bindir);
+        if (realpath(icons_path, dev_theme) != NULL
+                && ui_build_icon_path(dev_theme, dev_icon, sizeof(dev_icon)) == 0
+                && access(dev_icon, R_OK) == 0)
+            has_dev = 1;
+    }
+
+    const char* base = NULL;
+    if (has_install && has_dev) {
+        struct stat st_install;
+        struct stat st_dev;
+        if (stat(install_icon, &st_install) == 0 && stat(dev_icon, &st_dev) == 0
+                && st_dev.st_mtime > st_install.st_mtime)
+            base = dev_theme;
+        else
+            base = install_theme;
+    } else if (has_dev) {
+        base = dev_theme;
+    } else if (has_install) {
+        base = install_theme;
+    } else {
+        return -1;
+    }
+
+    if (ui_build_icon_path(base, icon_file, icon_size) != 0)
+        return -1;
+    strncpy(theme_path, base, theme_size);
+    theme_path[theme_size - 1] = '\0';
+    return 0;
+}
+
+/* GNOME caches tray images by path; publish a runtime copy keyed by mtime. */
+static int ui_refresh_tray_icon(int force) {
+    struct stat st;
+    if (stat(ui_icon_source, &st) != 0)
+        return -1;
+    if (!force && st.st_mtime == ui_icon_published_mtime
+            && ui_icon_published[0] != '\0'
+            && access(ui_icon_published, R_OK) == 0)
+        return 0;
+
+    const char* runtime = getenv("XDG_RUNTIME_DIR");
+    if (runtime == NULL || runtime[0] == '\0')
+        runtime = "/tmp";
+
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/clevo-indicator", runtime);
+    if (n < 0 || (size_t) n >= sizeof(dir))
+        return -1;
+    if (g_mkdir_with_parents(dir, 0700) != 0)
+        return -1;
+
+    char published[PATH_MAX];
+    n = snprintf(published, sizeof(published), "%s/fan-%lld.jpg", dir,
+            (long long) st.st_mtime);
+    if (n < 0 || (size_t) n >= sizeof(published))
+        return -1;
+
+    GFile* src = g_file_new_for_path(ui_icon_source);
+    GFile* dst = g_file_new_for_path(published);
+    GError* error = NULL;
+    if (!g_file_copy(src, dst, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error)) {
+        g_object_unref(src);
+        g_object_unref(dst);
+        if (error != NULL) {
+            fprintf(stderr, "Tray icon copy failed: %s\n", error->message);
+            g_error_free(error);
+        }
+        return -1;
+    }
+    g_object_unref(src);
+    g_object_unref(dst);
+
+    strncpy(ui_icon_published, published, sizeof(ui_icon_published) - 1);
+    ui_icon_published[sizeof(ui_icon_published) - 1] = '\0';
+    ui_icon_published_mtime = st.st_mtime;
+    return 1;
 }
 
 static void ui_format_status_menu(char* buf, size_t size) {
     snprintf(buf, size,
-            "CPU %d C   GPU %d C\n"
+            "CPU %d°C   GPU %d°C\n"
             "CPU Fan: %d%%  (%d RPM)\n"
             "GPU Fan: %d%%  (%d RPM)",
             share_info->cpu_temp, share_info->gpu_temp, share_info->fan1_duty,
@@ -506,28 +663,24 @@ static gboolean ui_update(gpointer user_data) {
     (void) user_data;
     if (share_info == NULL || indicator == NULL)
         return G_SOURCE_CONTINUE;
-    char tray_label[64];
+    char tray_label[32];
     char menu_label[512];
-    ui_format_status_tray(tray_label, sizeof(tray_label));
+    snprintf(tray_label, sizeof(tray_label), "C%d G%d", share_info->cpu_temp,
+            share_info->gpu_temp);
     ui_format_status_menu(menu_label, sizeof(menu_label));
     app_indicator_set_label(indicator, tray_label, INDICATOR_LABEL_GUIDE);
-    app_indicator_set_title(indicator, menu_label);
+    if (ui_refresh_tray_icon(0) > 0)
+        app_indicator_set_icon(indicator, ui_icon_published);
     if (status_menu_label != NULL)
         gtk_label_set_text(GTK_LABEL(status_menu_label), menu_label);
-    char icon_name[256];
-    int max_rpms = share_info->fan1_rpms;
-    if (share_info->fan2_rpms > max_rpms)
-        max_rpms = share_info->fan2_rpms;
-    double load = ((double) max_rpms) / MAX_FAN_RPM * 100.0;
-    double load_r = round(load / 5.0) * 5.0;
-    sprintf(icon_name, "brasero-disc-%02d", (int) load_r);
-    app_indicator_set_icon(indicator, icon_name);
     return G_SOURCE_CONTINUE;
 }
 
 static void ui_clear_manual_requests(void) {
     share_info->manual_next_fan1_duty = 0;
     share_info->manual_next_fan2_duty = 0;
+    share_info->manual_prev_fan1_duty = 0;
+    share_info->manual_prev_fan2_duty = 0;
 }
 
 static void ui_command_set_fan(long fan_duty) {
@@ -545,6 +698,10 @@ static void ui_command_set_fan(long fan_duty) {
         share_info->auto_duty = 0;
         share_info->auto_duty_val_fan1 = 0;
         share_info->auto_duty_val_fan2 = 0;
+        /* reset prev so the worker always rewrites, even if duty equals
+         * a previously requested value while auto control changed it. */
+        share_info->manual_prev_fan1_duty = 0;
+        share_info->manual_prev_fan2_duty = 0;
         share_info->manual_next_fan1_duty = fan_duty_val;
         share_info->manual_next_fan2_duty = fan_duty_val;
         ui_active_type = MANUAL_LINKED;
@@ -558,6 +715,7 @@ static void ui_command_set_fan1(long fan_duty) {
     printf("clicked on CPU fan duty: %d\n", fan_duty_val);
     share_info->auto_duty = 0;
     share_info->auto_duty_val_fan1 = 0;
+    share_info->manual_prev_fan1_duty = 0;
     share_info->manual_next_fan1_duty = fan_duty_val;
     ui_active_type = MANUAL_FAN1;
     ui_active_duty = fan_duty_val;
@@ -569,6 +727,7 @@ static void ui_command_set_fan2(long fan_duty) {
     printf("clicked on GPU fan duty: %d\n", fan_duty_val);
     share_info->auto_duty = 0;
     share_info->auto_duty_val_fan2 = 0;
+    share_info->manual_prev_fan2_duty = 0;
     share_info->manual_next_fan2_duty = fan_duty_val;
     ui_active_type = MANUAL_FAN2;
     ui_active_duty = fan_duty_val;
@@ -733,7 +892,6 @@ static uint8_t ec_io_read(const uint32_t port) {
     ec_io_wait(EC_SC, IBF, 0);
     outb(port, EC_DATA);
 
-    //wait_ec(EC_SC, EC_SC_IBF_FREE);
     ec_io_wait(EC_SC, OBF, 1);
     uint8_t value = inb(EC_DATA);
 

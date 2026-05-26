@@ -11,6 +11,9 @@ OBJ = $(patsubst %.c,$(OBJDIR)/%.o,$(SRC))
 
 TARGET = bin/clevo-indicator
 
+ICON_SRCDIR := icons/hicolor/scalable/status
+ICONS := fan.jpg
+
 PKG_CONFIG ?= pkg-config
 INDICATOR_PKGS := ayatana-appindicator3-0.1 gtk+-3.0
 INDICATOR_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(INDICATOR_PKGS))
@@ -25,18 +28,25 @@ LDFLAGS += $(INDICATOR_LIBS)
 
 all: $(TARGET)
 
-install: $(TARGET)
+install: install-bin install-icons
+
+install-icons: $(ICON_SRCDIR)/$(ICONS)
+	@echo "Installing tray icon to ${DSTDIR}/share/icons/hicolor/scalable/status/$(ICONS)"
+	@sudo install -Dm644 $(ICON_SRCDIR)/$(ICONS) \
+		${DSTDIR}/share/icons/hicolor/scalable/status/$(ICONS)
+
+install-bin: $(TARGET)
 	@echo "Installing to ${DSTDIR}/bin/clevo-indicator, setuid root"
 	@sudo install -o root -g adm -m 0750 $(TARGET) ${DSTDIR}/bin/clevo-indicator
 	@sudo chmod u+s ${DSTDIR}/bin/clevo-indicator
 	@ls -l ${DSTDIR}/bin/clevo-indicator
 
-.PHONY: all install clean
+.PHONY: all install install-bin install-icons clean
 
 $(TARGET): $(OBJ) Makefile
 	@mkdir -p bin
 	@echo linking $(TARGET) from $(OBJ)
-	@$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS) -lm
+	@$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS)
 
 clean:
 	rm -f $(OBJ) $(TARGET)
