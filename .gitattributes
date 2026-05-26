@@ -1,0 +1,6 @@
+# Linux-targeted project: keep LF in repo and working tree on all platforms.
+* text=auto eol=lf
+
+*.jpg binary
+*.png binary
+*.ico binary
